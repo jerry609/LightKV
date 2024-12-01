@@ -11,8 +11,9 @@
         <sourceTestOutputDir name="target/generated-test-sources/test-annotations" />
         <outputRelativeToContentRoot value="true" />
         <module name="kv-common" />
-        <module name="kv-client" />
         <module name="kv-server" />
+        <module name="kv-client" />
+        <module name="kv-thrift" />
       </profile>
     </annotationProcessing>
     <bytecodeTargetLevel>

@@ -31,11 +31,6 @@
         </dependency>
 
         <!-- Internal project dependencies -->
-        <dependency>
-            <groupId>com.kv</groupId>
-            <artifactId>kv-server</artifactId>
-            <version>${project.version}</version>
-        </dependency>
 
         <!-- Logging dependencies -->
         <dependency>
