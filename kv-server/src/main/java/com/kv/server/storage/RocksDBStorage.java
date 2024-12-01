@@ -13,24 +13,34 @@ import java.io.ByteArrayOutputStream;
 import java.io.ObjectOutputStream;
 import java.io.ObjectInputStream;
 import java.io.ByteArrayInputStream;
+import com.google.common.cache.Cache;
+import com.google.common.cache.CacheBuilder;
+import java.util.concurrent.TimeUnit;
 
 public class RocksDBStorage implements KVStorage {
-    private RocksDB db;
-    private BloomFilterImpl bloomFilter;
-    private static final int DEFAULT_EXPECTED_INSERTIONS = 1000000;
+    private final RocksDB db;
+    private final BloomFilterImpl bloomFilter;
+    private final Cache<byte[], byte[]> cache;
+    private static final int DEFAULT_EXPECTED_INSERTIONS = 1_000_000;
     private static final double DEFAULT_FPP = 0.01;
+    private static final int DEFAULT_MAXIMUM_CACHE_SIZE = 10_000;
+    private static final int DEFAULT_TIME_LIMIT = 10;
 
     public RocksDBStorage() {
         Options options = new Options()
-            .setCreateIfMissing(true)
-            .setWriteBufferSize(64 * 1024 * 1024)
-            .setMaxWriteBufferNumber(3)
-            .setMaxBackgroundCompactions(10);
+                .setCreateIfMissing(true)
+                .setWriteBufferSize(64 * 1024 * 1024)
+                .setMaxWriteBufferNumber(3)
+                .setMaxBackgroundCompactions(10);
 
         try {
             RocksDB.loadLibrary();
             db = RocksDB.open(options, "rocksdb-data");
             bloomFilter = new BloomFilterImpl(DEFAULT_EXPECTED_INSERTIONS, DEFAULT_FPP);
+            this.cache = CacheBuilder.newBuilder()
+                    .maximumSize(DEFAULT_MAXIMUM_CACHE_SIZE)
+                    .expireAfterAccess(DEFAULT_TIME_LIMIT, TimeUnit.MINUTES)
+                    .build();
         } catch (RocksDBException e) {
             throw new RuntimeException("Failed to initialize RocksDB", e);
         }
@@ -40,6 +50,7 @@ public class RocksDBStorage implements KVStorage {
     public void put(byte[] key, byte[] value) {
         try {
             db.put(key, value);
+            cache.put(key, value);
             bloomFilter.add(key);
         } catch (RocksDBException e) {
             throw new RuntimeException("Failed to put key-value", e);
@@ -51,8 +62,17 @@ public class RocksDBStorage implements KVStorage {
         if (!bloomFilter.mightContain(key)) {
             return null;
         }
+        byte[] value = cache.getIfPresent(key);
+        if (value != null) {
+            return value;
+        }
+
         try {
-            return db.get(key);
+            value = db.get(key);
+            if (value != null) {
+                cache.put(key, value);
+            }
+            return value;
         } catch (RocksDBException e) {
             throw new RuntimeException("Failed to get value", e);
         }
@@ -63,6 +83,7 @@ public class RocksDBStorage implements KVStorage {
         try {
             db.delete(key);
             // Note: We don't remove from bloom filter as it doesn't support removal
+            cache.invalidate(key);
         } catch (RocksDBException e) {
             throw new Exception("Failed to delete key", e);
         }
