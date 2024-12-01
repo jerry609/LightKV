@@ -1,5 +1,81 @@
 # 分布式KV存储系统文件准备说明
 
+1. 多机分布式数据存储与RPC：
+```
+kv-thrift/
+├── KVService.thrift    # Thrift RPC接口定义
+└── kv.thrift          # 基础数据类型定义
+```
+
+2. 数据的增加、修改和删除：
+```
+kv-server/src/main/java/com/kv/server/storage/
+├── KVStorage.java     # 存储接口定义
+└── RocksDBStorage.java # 具体存储实现，包含增删改操作
+```
+
+3. 多副本存储：
+```
+kv-server/src/main/java/com/kv/server/consensus/
+├── RaftNode.java      # Raft协议实现，处理副本同步
+└── KVStateMachine.java # 状态机实现，确保多副本一致性
+```
+
+4. 读写接口/检索界面：
+```
+kv-client/src/main/java/com/kv/client/
+├── KVClient.java      # 客户端API
+└── KVCommandClient.java # 命令行交互界面
+```
+
+5. 数据写入日志和一致性协议：
+```
+kv-server/src/main/java/com/kv/server/
+├── consensus/RocksDBLogStore.java # 写入日志存储
+└── consensus/RaftNode.java       # Raft一致性协议实现
+```
+
+6. 元数据管理：
+```
+kv-server/src/main/java/com/kv/server/meta/
+├── MetadataManager.java # 元数据管理器
+└── RouterManager.java   # 路由管理
+```
+
+7. Bloomfilter索引：
+```
+kv-server/src/main/java/com/kv/server/storage/
+└── BloomFilterImpl.java # 布隆过滤器实现
+```
+
+8. 数据分片：
+```
+kv-server/src/main/java/com/kv/server/meta/
+└── ConsistentHash.java # 一致性哈希实现，用于数据分片
+```
+
+9. 其他特性：
+- 异常处理：
+```
+kv-common/src/main/java/com/kv/common/exception/
+└── KVException.java
+```
+- 工具类：
+```
+kv-common/src/main/java/com/kv/common/utils/
+├── NetworkUtil.java
+├── SerializationUtil.java
+└── SerializeUtil.java
+```
+
+基础模型定义：
+```
+kv-common/src/main/java/com/kv/common/model/
+├── KeyValue.java      # KV数据模型
+├── Operation.java     # 操作模型
+└── StorageNode.java   # 存储节点模型
+```
+
 ## 1. 项目结构
 项目由四个主要模块组成：
 
