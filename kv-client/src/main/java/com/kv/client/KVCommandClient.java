@@ -90,14 +90,15 @@ public class KVCommandClient implements AutoCloseable {
     }
 
     public static void main(String[] args) {
-        if (args.length != 2) {
-            System.out.println("Usage: KVCommandClient <host> <port>");
-            System.exit(1);
-        }
-
-        String host = args[0];
-        int port = Integer.parseInt(args[1]);
-
+//        if (args.length != 2) {
+//            System.out.println("Usage: KVCommandClient <host> <port>");
+//            System.exit(1);
+//        }
+//
+//        String host = args[0];
+//        int port = Integer.parseInt(args[1]);
+        String host="127.0.0.1";
+        int port=8090;
         try (KVCommandClient cli = new KVCommandClient(host, port)) {
             cli.start();
         } catch (Exception e) {

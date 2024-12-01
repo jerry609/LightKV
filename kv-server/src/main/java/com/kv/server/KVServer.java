@@ -29,7 +29,6 @@ public class KVServer {
         try (FileInputStream fis = new FileInputStream(configPath)) {
             config.load(fis);
         }
-
         // 初始化节点ID
         this.nodeId = config.getProperty("node.id");
 
@@ -56,6 +55,7 @@ public class KVServer {
 
         for (String peerConfig : peerConfigs) {
             String[] parts = peerConfig.split(":");
+            System.out.println(parts[2]);
             peers.add(new RaftPeer(parts[0], parts[1], Integer.parseInt(parts[2])));
         }
 
@@ -89,15 +89,18 @@ public class KVServer {
     }
 
     public static void main(String[] args) throws Exception {
-        if (args.length != 3) {
-            System.out.println("Usage: KVServer <config_path> <port> <replica_count>");
-            System.exit(1);
-        }
-
-        String configPath = args[0];
-        int port = Integer.parseInt(args[1]);
-        int replicaCount = Integer.parseInt(args[2]);
-
+//        if (args.length != 3) {
+//            System.out.println("Usage: KVServer <config_path> <port> <replica_count>");
+//            System.exit(1);
+//        }
+//
+//        String configPath = args[0];
+//        int port = Integer.parseInt(args[1]);
+//        int replicaCount = Integer.parseInt(args[2]);
+        System.out.println("Current working directory: " + System.getProperty("user.dir"));
+        String configPath="./kv-server/config.properties";
+        int port=8090;
+        int replicaCount=3;
         try {
             KVServer server = new KVServer(configPath, port, replicaCount);
 
