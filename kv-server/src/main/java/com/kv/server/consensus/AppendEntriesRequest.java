@@ -33,4 +33,3 @@ public class AppendEntriesRequest {
     public List<LogEntry> getEntries() { return entries; }
     public long getLeaderCommit() { return leaderCommit; }
 }
-

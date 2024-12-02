@@ -1,17 +1,16 @@
 #!/bin/bash
 
-if [ $# -ne 2 ]; then
-    echo "Usage: $0 <node-id> <config-path>"
+if [ $# -ne 1 ]; then
+    echo "Usage: $0 <config-path>"
     exit 1
 fi
 
-NODE_ID=$1
-CONFIG_PATH=$2
+CONFIG_PATH=$1
 
-# 设置CLASSPATH
-CLASSPATH="/Users/jerry/lib/*"
+# 设置 CLASSPATH
+CLASSPATH="/Users/jerry/lib/kv-server-1.0-SNAPSHOT.jar"
 
-# 设置JVM参数
+# 设置 JVM 参数
 JVM_OPTS="-Xms512m -Xmx1024m -XX:+UnlockExperimentalVMOptions -XX:+UseG1GC"
 
 # 启动服务器

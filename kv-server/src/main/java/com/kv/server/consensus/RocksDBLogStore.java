@@ -1,19 +1,19 @@
 package com.kv.server.consensus;
 
-
 import com.kv.server.storage.LogStore;
 import org.rocksdb.*;
 
-import java.io.File;
-import java.io.IOException;
-import java.util.*;
+import java.io.*;
 import java.nio.ByteBuffer;
+import java.util.*;
+import java.util.concurrent.atomic.AtomicLong;
 
 public class RocksDBLogStore implements LogStore {
     private final RocksDB db;
-    private volatile long lastIndex;
-    private volatile long commitIndex;
+    private final AtomicLong lastIndex = new AtomicLong(0);
+    private final AtomicLong commitIndex = new AtomicLong(0);
     private final String dbPath;
+
     public RocksDBLogStore(String dbPath) {
         this.dbPath = dbPath;
         try {
@@ -38,19 +38,20 @@ public class RocksDBLogStore implements LogStore {
                     .setMaxBackgroundCompactions(10);
 
             // 初始化 RocksDB
-            RocksDB.loadLibrary();
             db = RocksDB.open(options, dbPath);
+
+            // 初始化 lastIndex
+            initializeLastIndex();
         } catch (RocksDBException e) {
             throw new RuntimeException("Failed to initialize RocksDB at path: " + dbPath, e);
         }
     }
 
     private void initializeLastIndex() {
-        try {
-            RocksIterator iter = db.newIterator();
+        try (RocksIterator iter = db.newIterator()) {
             iter.seekToLast();
             if (iter.isValid()) {
-                lastIndex = ByteBuffer.wrap(iter.key()).getLong();
+                lastIndex.set(bytesToLong(iter.key()));
             }
         } catch (Exception e) {
             throw new RuntimeException("Failed to initialize last index", e);
@@ -58,16 +59,32 @@ public class RocksDBLogStore implements LogStore {
     }
 
     @Override
-    public void append(LogEntry entry) {
+    public synchronized void append(LogEntry entry) {
         try {
             byte[] key = longToBytes(entry.getIndex());
             byte[] value = serialize(entry);
             db.put(key, value);
-            lastIndex = entry.getIndex();
+            lastIndex.set(entry.getIndex());
         } catch (RocksDBException e) {
             throw new RuntimeException("Failed to append log entry", e);
         }
     }
+
+    @Override
+    public synchronized void append(List<LogEntry> entries) {
+        try (WriteBatch writeBatch = new WriteBatch()) {
+            for (LogEntry entry : entries) {
+                byte[] key = longToBytes(entry.getIndex());
+                byte[] value = serialize(entry);
+                writeBatch.put(key, value);
+                lastIndex.set(entry.getIndex());
+            }
+            db.write(new WriteOptions(), writeBatch);
+        } catch (RocksDBException e) {
+            throw new RuntimeException("Failed to append log entries", e);
+        }
+    }
+
 
     @Override
     public LogEntry getEntry(long index) {
@@ -98,12 +115,15 @@ public class RocksDBLogStore implements LogStore {
 
     @Override
     public long getLastIndex() {
-        return lastIndex;
+        return lastIndex.get();
     }
 
     @Override
     public long getLastTerm() {
-        LogEntry lastEntry = getEntry(lastIndex);
+        if (lastIndex.get() == 0) {
+            return 0;
+        }
+        LogEntry lastEntry = getEntry(lastIndex.get());
         return lastEntry != null ? lastEntry.getTerm() : 0;
     }
 
@@ -114,44 +134,43 @@ public class RocksDBLogStore implements LogStore {
     }
 
     @Override
-    public long getCommitIndex() {
-        return commitIndex;
-    }
-
-    @Override
-    public void setCommitIndex(long commitIndex) {
-        this.commitIndex = commitIndex;
+    public boolean containsEntry(long index, long term) {
+        LogEntry entry = getEntry(index);
+        return entry != null && entry.getTerm() == term;
     }
 
     @Override
     public void close() {
         if (db != null) {
-            // Make sure to close any open iterators before closing the database
-            try (RocksIterator iter = db.newIterator()) {
-                // Close iterator explicitly
-                iter.close();
-            } catch (Exception e) {
-                // Log the error but continue with closing db
-                e.printStackTrace();
-            }
-
-            // Close the database
             db.close();
         }
     }
 
-
     private byte[] longToBytes(long value) {
-        return ByteBuffer.allocate(8).putLong(value).array();
+        return ByteBuffer.allocate(Long.BYTES).putLong(value).array();
+    }
+
+    private long bytesToLong(byte[] bytes) {
+        return ByteBuffer.wrap(bytes).getLong();
     }
 
     private LogEntry deserialize(byte[] data) {
-        // 实现反序列化逻辑
-        return null;
+        try (ByteArrayInputStream bais = new ByteArrayInputStream(data);
+             ObjectInputStream ois = new ObjectInputStream(bais)) {
+            return (LogEntry) ois.readObject();
+        } catch (IOException | ClassNotFoundException e) {
+            throw new RuntimeException("Failed to deserialize LogEntry", e);
+        }
     }
 
     private byte[] serialize(LogEntry entry) {
-        // 实现序列化逻辑
-        return null;
+        try (ByteArrayOutputStream baos = new ByteArrayOutputStream();
+             ObjectOutputStream oos = new ObjectOutputStream(baos)) {
+            oos.writeObject(entry);
+            oos.flush();
+            return baos.toByteArray();
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to serialize LogEntry", e);
+        }
     }
 }

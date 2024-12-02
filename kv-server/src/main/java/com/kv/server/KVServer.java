@@ -20,69 +20,106 @@ public class KVServer {
     private final MetadataManager metadataManager;
     private final RouterManager routerManager;
     private final RaftNode raftNode;
-    private final int port;
-    public KVServer(String configPath, int port, int replicaCount) throws Exception {
-        this.port = port;
+    private final int kvPort;        // KV service port
+    private final int raftPort;      // Raft communication port
+    private final Properties config; // 保留配置为类成员
 
-        // 加载配置文件
-        Properties config = new Properties();
+    public KVServer(String configPath) throws Exception {
+        // Load configuration file
+        config = new Properties();
         try (FileInputStream fis = new FileInputStream(configPath)) {
             config.load(fis);
         }
 
-        // 初始化节点ID
+        // Initialize node ID
         this.nodeId = config.getProperty("node.id");
+        if (this.nodeId == null || this.nodeId.isEmpty()) {
+            throw new IllegalArgumentException("node.id is not specified in the configuration file.");
+        }
 
-        // 创建元数据管理器
-        this.metadataManager = new MetadataManager("id","127.0.0.1",8080);
+        // Initialize KV service port
+        this.kvPort = Integer.parseInt(config.getProperty("server.port"));
+        if (this.kvPort <= 0) {
+            throw new IllegalArgumentException("Invalid server.port in the configuration file.");
+        }
 
-        // 初始化Raft peers
+        // Initialize Raft communication port
+        this.raftPort = Integer.parseInt(config.getProperty("raft.server.port"));
+        if (this.raftPort <= 0) {
+            throw new IllegalArgumentException("Invalid raft.server.port in the configuration file.");
+        }
+
+        // Initialize replica count
+        int replicaCount = Integer.parseInt(config.getProperty("cluster.replication-factor", "3"));
+
+        // Create metadata manager
+        String metadataHost = config.getProperty("metadata.host", "127.0.0.1");
+        int metadataPort = Integer.parseInt(config.getProperty("metadata.port", "8080"));
+        this.metadataManager = new MetadataManager(this.nodeId, metadataHost, metadataPort);
+
+        // Initialize Raft peers
         List<RaftPeer> peers = loadPeersFromConfig(config);
 
-        // 获取RocksDB路径
-        String dbPath = config.getProperty("rocksdb.path", "/Users/jerry/data/" + nodeId + "/raft-log");
+        // Get RocksDB path and Raft log path
+        String rocksdbPath = config.getProperty("rocksdb.path", "/data/" + nodeId + "/rocksdb-data");
+        String raftLogPath = config.getProperty("raft.log-path", "/data/" + nodeId + "/raft-log");
 
-        // 创建Raft节点，传入dbPath
-        this.raftNode = new RaftNode(nodeId, peers, dbPath);  // 修复了这里的dbPath参数
+        // Create RaftNode with separate raftPort
+        this.raftNode = new RaftNode(nodeId, peers, rocksdbPath, raftLogPath, raftPort);
 
-        // 创建路由管理器
+        // Create router manager
         this.routerManager = new RouterManager(metadataManager, replicaCount);
 
-        // 注册Raft状态变更监听器
+        // Register Raft state change listener
         raftNode.setLeaderChangeListener(newLeaderId ->
                 metadataManager.updateLeader(newLeaderId));
     }
 
-    private List<RaftPeer> loadPeersFromConfig(Properties config) {
+    private List<RaftPeer> loadPeersFromConfig(Properties config) throws Exception {
         List<RaftPeer> peers = new ArrayList<>();
-        String[] peerConfigs = config.getProperty("cluster.peers").split(",");
+        String peersConfig = config.getProperty("cluster.peers");
+        if (peersConfig == null || peersConfig.isEmpty()) {
+            throw new IllegalArgumentException("cluster.peers is not specified in the configuration file.");
+        }
 
+        String[] peerConfigs = peersConfig.split(",");
         for (String peerConfig : peerConfigs) {
             String[] parts = peerConfig.split(":");
-            System.out.println(parts[2]);
-            peers.add(new RaftPeer(parts[0], parts[1], Integer.parseInt(parts[2])));
+            if (parts.length != 3) {
+                throw new IllegalArgumentException("Invalid peer configuration: " + peerConfig);
+            }
+            String peerId = parts[0];
+            String peerHost = parts[1];
+            int peerPort = Integer.parseInt(parts[2]);
+            peers.add(new RaftPeer(peerId, peerHost, peerPort));
         }
 
         return peers;
     }
 
     public void start() throws Exception {
-        // 启动Raft节点
+        // Start Raft node
         raftNode.start();
 
-        // 创建Thrift服务处理器
+        // Create Thrift service handler
         KVServiceImpl handler = new KVServiceImpl(routerManager, raftNode);
         KVService.Processor<KVServiceImpl> processor = new KVService.Processor<>(handler);
 
-        // 启动Thrift服务器
-        TServerTransport serverTransport = new TServerSocket(port);
+        // Start Thrift server for KV service
+        TServerTransport serverTransport = new TServerSocket(kvPort);
+
+        // 从配置文件中读取线程池参数
+        int minThreads = Integer.parseInt(config.getProperty("thread.pool.min", "4"));
+        int maxThreads = Integer.parseInt(config.getProperty("thread.pool.max", "32"));
+
         TThreadPoolServer.Args args = new TThreadPoolServer.Args(serverTransport)
-            .processor(processor)
-            .minWorkerThreads(4)
-            .maxWorkerThreads(32);
+                .processor(processor)
+                .minWorkerThreads(minThreads)
+                .maxWorkerThreads(maxThreads);
 
         TThreadPoolServer server = new TThreadPoolServer(args);
-        System.out.println("KV Server started on port " + port + " with nodeId: " + nodeId);
+        System.out.println("KV Server started on port " + kvPort + " with nodeId: " + nodeId);
+        System.out.println("Raft communication port: " + raftPort);
         server.serve();
     }
 
@@ -101,20 +138,11 @@ public class KVServer {
 
             String configPath = args[0];
 
-            // 从配置文件读取端口和副本数
-            Properties config = new Properties();
-            try (FileInputStream fis = new FileInputStream(configPath)) {
-                config.load(fis);
-            }
-
-            int port = Integer.parseInt(config.getProperty("server.port"));
-            int replicaCount = Integer.parseInt(config.getProperty("replica.count", "3"));
-
-            // 创建并启动服务器
-            KVServer server = new KVServer(configPath, port, replicaCount);
+            // Create and start server
+            KVServer server = new KVServer(configPath);
             server.start();
 
-            // 添加关闭钩子
+            // Add shutdown hook
             Runtime.getRuntime().addShutdownHook(new Thread(server::stop));
 
         } catch (Exception e) {

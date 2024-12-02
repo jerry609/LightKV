@@ -1,355 +1,985 @@
 package com.kv.server.consensus;
 
-
 import com.kv.server.storage.LogStore;
+import com.kv.thrift.AppendEntriesRequest;
+import com.kv.thrift.AppendEntriesResponse;
+import com.kv.thrift.LogEntry;
+import com.kv.thrift.RaftService;
+import com.kv.thrift.RequestVoteRequest;
+import com.kv.thrift.RequestVoteResponse;
 import lombok.Getter;
+import lombok.SneakyThrows;
+import org.apache.thrift.TException;
+import org.apache.thrift.protocol.TBinaryProtocol;
+import org.apache.thrift.server.TServer;
+import org.apache.thrift.server.TThreadPoolServer;
+import org.apache.thrift.transport.TServerSocket;
+import org.apache.thrift.transport.TServerTransport;
+import org.apache.thrift.transport.TTransportFactory;
+import org.apache.thrift.transport.layered.TFramedTransport;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.File;
-import java.util.ArrayList;
-import java.util.List;
+import java.io.IOException;
+import java.net.InetSocketAddress;
+import java.net.ServerSocket;
+import java.nio.ByteBuffer;
+import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.Random;
+import java.util.stream.Collectors;
 
-public class RaftNode {
-    // 导入声明部分的修改
-    private static final int ELECTION_TIMEOUT_MIN = 150;
-    private static final int ELECTION_TIMEOUT_MAX = 300;
+public class RaftNode implements RaftService.Iface {
+    private static final Logger log = LoggerFactory.getLogger(RaftNode.class);
+    private static final long HEARTBEAT_INTERVAL = 500;    // 降低到 500ms
+    private static final long HEARTBEAT_TIMEOUT_MS = 2000; // 降低到 2s
+    private static final int ELECTION_TIMEOUT_MIN = 3000;  // 降低到 3s
+    private static final int ELECTION_TIMEOUT_MAX = 4500;  // 降低到 4.5s
+    private static final int ELECTION_TIMER_RESET_MIN_INTERVAL = 1000; // 新增：最小重置间隔
 
+    private volatile long lastElectionTimerReset = 0; // 新增：记录上次重置时间
+    // Constants
+    private static final int SOCKET_TIMEOUT_MS = 10000;       // Socket超时设为10s
+    private static final int RETRY_ATTEMPTS = 3;
+    private static final long RETRY_DELAY_MS = 1000;
+    private static final int MAX_RETRY_ATTEMPTS = 3;
+    private static final long CONNECT_RETRY_DELAY_MS = 1000;
+
+    // Core components
     private final String nodeId;
     private final List<RaftPeer> peers;
     private final LogStore logStore;
-    /**
-     * -- GETTER --
-     *  Gets the state machine instance.
-     *
-     * @return The KV state machine
-     */
     @Getter
     private final KVStateMachine stateMachine;
+    private final int port;
+
+    // Thread pools
     private final ScheduledExecutorService scheduler;
+    private final ExecutorService rpcExecutor;
+    private TServer raftServer;
+
+    // Node state
     private volatile NodeState state;
     private volatile String currentLeader;
     private final AtomicLong currentTerm;
     private volatile String votedFor;
-    private final ConcurrentMap<Long, CompletableFuture<Boolean>> pendingProposals;
-    private ScheduledFuture<?> electionTimer;
-    private final Random random;
+
+    // Progress tracking
     private volatile long commitIndex;
     private volatile long lastApplied;
+    private final ConcurrentMap<Long, CompletableFuture<Boolean>> pendingProposals;
+    private final ConcurrentMap<String, Long> lastHeartbeatTime;
+    private ScheduledFuture<?> electionTimer;
+    private final Random random;
+
     private LeaderChangeListener leaderChangeListener;
 
-    public RaftNode(String nodeId, List<RaftPeer> peers, String dbPath) {
+    public RaftNode(String nodeId, List<RaftPeer> peers, String rocksdbPath,
+                    String raftLogPath, int port) {
         this.nodeId = nodeId;
         this.peers = peers;
+        this.port = port;
 
-        // 创建日志和状态机的目录路径
-        String logPath = dbPath + File.separator + "log";
-        String statePath = dbPath + File.separator + "state";
+        // Initialize directories
+        String logPath = raftLogPath + File.separator + "log";
+        String statePath = raftLogPath + File.separator + "state";
+        createDirectories(raftLogPath);
 
-        // 确保父目录存在
-        File baseDir = new File(dbPath);
-        if (!baseDir.exists() && !baseDir.mkdirs()) {
-            throw new RuntimeException("Failed to create base directory: " + dbPath);
-        }
-
+        // Initialize core components
         this.logStore = new RocksDBLogStore(logPath);
-        this.stateMachine = new KVStateMachine(statePath);
+        this.stateMachine = new KVStateMachine(rocksdbPath);
+
+        // Initialize thread pools
         this.scheduler = Executors.newScheduledThreadPool(2);
+        this.rpcExecutor = Executors.newFixedThreadPool(4);
+
+        // Initialize state
         this.state = NodeState.FOLLOWER;
         this.currentTerm = new AtomicLong(0);
-        this.pendingProposals = new ConcurrentHashMap<>();
-        this.random = new Random();
+        this.votedFor = null;
         this.commitIndex = 0;
         this.lastApplied = 0;
-    }
-    public void setLeaderChangeListener(LeaderChangeListener listener) {
-        this.leaderChangeListener = listener;
+
+        // Initialize tracking maps
+        this.pendingProposals = new ConcurrentHashMap<>();
+        this.lastHeartbeatTime = new ConcurrentHashMap<>();
+        this.random = new Random();
+
+        log.info("RaftNode initialized with ID: {}, port: {}", nodeId, port);
     }
 
-    private void checkHeartbeat() {
-        if (state != NodeState.LEADER) {
-            return;
+    private void createDirectories(String raftLogPath) {
+        File baseDir = new File(raftLogPath);
+        if (!baseDir.exists() && !baseDir.mkdirs()) {
+            throw new RuntimeException("Failed to create base directory: " + raftLogPath);
+        }
+    }
+
+    private boolean preVote() throws InterruptedException {
+        AtomicInteger votesReceived = new AtomicInteger(1);
+        CountDownLatch votingComplete = new CountDownLatch(peers.size());
+
+        // 增加超时时间
+        long timeout = ELECTION_TIMEOUT_MIN;
+
+        // 为每个peer添加重试机制
+        for (RaftPeer peer : peers) {
+            if (peer.getId().equals(nodeId)) {
+                votingComplete.countDown();
+                continue;
+            }
+
+            rpcExecutor.execute(() -> {
+                for (int attempt = 0; attempt < RETRY_ATTEMPTS; attempt++) {
+                    try {
+                        RequestVoteRequest request = new RequestVoteRequest(
+                                currentTerm.get() + 1,
+                                nodeId,
+                                logStore.getLastIndex(),
+                                logStore.getLastTerm()
+                        );
+                        RequestVoteResponse response = peer.requestVote(request);
+                        if (response.voteGranted) {
+                            votesReceived.incrementAndGet();
+                        }
+                        break;
+                    } catch (Exception e) {
+                        if (attempt == RETRY_ATTEMPTS - 1) {
+                            log.warn("Failed to get pre-vote from peer {}: {}",
+                                    peer.getId(), e.getMessage());
+                        }
+                    }
+                    try {
+                        Thread.sleep(RETRY_DELAY_MS);
+                    } catch (InterruptedException e) {
+                        throw new RuntimeException(e);
+                    }
+                }
+                votingComplete.countDown();
+            });
         }
 
-        // 发送心跳
-        sendHeartbeat();
+        return votingComplete.await(timeout, TimeUnit.MILLISECONDS) &&
+                votesReceived.get() > peers.size() / 2;
     }
-
-    private void resetElectionTimer() {
-        if (electionTimer != null) {
-            electionTimer.cancel(false);
-        }
-
-        int timeout = ELECTION_TIMEOUT_MIN +
-                random.nextInt(ELECTION_TIMEOUT_MAX - ELECTION_TIMEOUT_MIN);
-
-        electionTimer = scheduler.schedule(
-                this::startElection,
-                timeout,
-                TimeUnit.MILLISECONDS
-        );
-    }
-
-    private void startElection() {
-        state = NodeState.CANDIDATE;
-        currentTerm.incrementAndGet();
-        votedFor = nodeId;
-        AtomicInteger votesReceived = new AtomicInteger(1);  // 投给自己的一票
-
-        // 请求其他节点投票
+    private void checkPeerHealth() {
+        long now = System.currentTimeMillis();
         for (RaftPeer peer : peers) {
             if (peer.getId().equals(nodeId)) {
                 continue;
             }
 
-            scheduler.execute(() -> {
-                try {
-                    RequestVoteRequest request = new RequestVoteRequest(
-                            currentTerm.get(),
-                            nodeId,
-                            logStore.getLastIndex(),
-                            logStore.getLastTerm()
-                    );
+            Long lastHeartbeat = lastHeartbeatTime.get(peer.getId());
+            if (lastHeartbeat == null || now - lastHeartbeat > HEARTBEAT_TIMEOUT_MS) {
+                log.warn("Peer {} might be unavailable, attempting reconnection", peer.getId());
 
-                    RequestVoteResponse response = peer.requestVote(request);
-                    if (response.isVoteGranted()) {
-                        synchronized (this) {
-                            votesReceived.getAndIncrement();
-                            if (state == NodeState.CANDIDATE &&
-                                    votesReceived.get() > peers.size() / 2) {
-                                becomeLeader();
+                // 使用同步锁避免并发重连
+                synchronized(peer) {
+                    // 再次检查，避免在获取锁期间状态已改变
+                    lastHeartbeat = lastHeartbeatTime.get(peer.getId());
+                    if (lastHeartbeat == null || now - lastHeartbeat > HEARTBEAT_TIMEOUT_MS) {
+                        // 重置连接前先关闭现有连接
+                        peer.resetConnections();
+
+                        // 使用指数退避进行重连
+                        for (int attempt = 0; attempt < MAX_RETRY_ATTEMPTS; attempt++) {
+                            if (peer.reconnect()) {
+                                log.info("Successfully reconnected to peer {} after {} attempts",
+                                        peer.getId(), attempt + 1);
+                                lastHeartbeatTime.put(peer.getId(), now);
+                                break;
+                            }
+                            // 指数退避等待
+                            try {
+                                Thread.sleep(RETRY_DELAY_MS * (1L << Math.min(attempt, 4)));
+                            } catch (InterruptedException ie) {
+                                Thread.currentThread().interrupt();
+                                break;
                             }
                         }
                     }
-                } catch (Exception e) {
-                    // 处理投票请求失败
                 }
-            });
+            }
         }
     }
 
-    private void becomeLeader() {
-        state = NodeState.LEADER;
-        currentLeader = nodeId;
+    public void startRaftServer() throws Exception {
+        // 创建 ServerSocket 实例
+        ServerSocket serverSocket = new ServerSocket();
+        serverSocket.setReuseAddress(true);
+        serverSocket.setReceiveBufferSize(64 * 1024);  // 64KB receive buffer
 
-        // 初始化所有节点的nextIndex
-        for (RaftPeer peer : peers) {
-            peer.setNextIndex(logStore.getLastIndex() + 1);
+        // 绑定地址和端口
+        InetSocketAddress bindAddr = new InetSocketAddress(port);
+        serverSocket.bind(bindAddr);
+
+        // 创建自定义的 TServerTransport
+        int clientTimeout = 5000; // 5秒客户端超时
+        int maxMessageSize = 64 * 1024 * 1024; // 64MB
+        CustomTServerSocket customServerSocket = new CustomTServerSocket(serverSocket, clientTimeout, maxMessageSize);
+
+        // 创建 Thrift 处理器
+        RaftService.Processor<RaftNode> processor = new RaftService.Processor<>(this);
+
+        // 设置 Thrift 传输工厂
+        TFramedTransport.Factory transportFactory = new TFramedTransport.Factory(maxMessageSize);
+
+        // 配置 Thrift 服务器参数
+        TThreadPoolServer.Args args = new TThreadPoolServer.Args(customServerSocket)
+                .processor(processor)
+                .protocolFactory(new TBinaryProtocol.Factory())
+                .transportFactory(transportFactory)
+                .minWorkerThreads(4)
+                .maxWorkerThreads(8);
+
+        // 创建 Thrift 服务器实例
+        raftServer = new TThreadPoolServer(args);
+
+        // 使用守护线程启动服务器
+        Thread serverThread = new Thread(() -> {
+            try {
+                log.info("Raft Thrift Server starting on port {} with nodeId: {}", port, nodeId);
+                raftServer.serve();
+            } catch (Exception e) {
+                log.error("Raft server error", e);
+            }
+        }, "raft-server-thread");
+
+        serverThread.setDaemon(true);
+        serverThread.start();
+
+        // 等待服务器完全启动
+        Thread.sleep(1000);
+
+        // 验证服务器是否正常启动
+        if (!serverSocket.isBound() || serverSocket.isClosed()) {
+            throw new IllegalStateException("Failed to start Raft server on port " + port);
         }
 
-        // 通知领导者变更
+        log.info("Raft Thrift Server successfully started on port {} with nodeId: {}", port, nodeId);
+    }
+
+    // 添加相关常量
+    private static final int MAX_MESSAGE_SIZE = 16 * 1024 * 1024;  // 16MB 最大消息大小
+    private synchronized void startElection() throws InterruptedException {
+        if (state == NodeState.LEADER) {
+            return;
+        }
+
+        if (!preVote()) {
+            log.info("Pre-vote failed, not starting election");
+            resetElectionTimer();
+            return;
+        }
+
+        try {
+            state = NodeState.CANDIDATE;
+            long newTerm = currentTerm.incrementAndGet();
+            votedFor = nodeId;
+            currentLeader = null;
+
+            log.info("Starting election for term {} on node {}", newTerm, nodeId);
+
+            final int requiredVotes = (peers.size() / 2) + 1;
+            final AtomicInteger votesReceived = new AtomicInteger(1);
+            CountDownLatch votingComplete = new CountDownLatch(peers.size());
+
+            requestVotesFromPeers(newTerm, votesReceived, requiredVotes, votingComplete);
+
+            if (!votingComplete.await(ELECTION_TIMEOUT_MAX, TimeUnit.MILLISECONDS)) {
+                log.warn("Election for term {} timed out", newTerm);
+                stepDown(newTerm);
+                return;
+            }
+
+            if (state == NodeState.CANDIDATE && votesReceived.get() >= requiredVotes) {
+                becomeLeader();
+            }
+
+        } catch (Exception e) {
+            log.error("Error during election: {}", e.getMessage());
+            stepDown(currentTerm.get());
+        } finally {
+            resetElectionTimer();
+        }
+    }
+
+    private void requestVotesFromPeers(
+            long term,
+            AtomicInteger votesReceived,
+            int requiredVotes,
+            CountDownLatch votingComplete) {
+
+        RequestVoteRequest request = new RequestVoteRequest(
+                term,
+                nodeId,
+                logStore.getLastIndex(),
+                logStore.getLastTerm()
+        );
+
+        for (RaftPeer peer : peers) {
+            if (peer.getId().equals(nodeId)) {
+                votingComplete.countDown();
+                continue;
+            }
+
+            rpcExecutor.execute(() -> requestVoteFromPeer(
+                    peer, request, votesReceived, requiredVotes, votingComplete));
+        }
+    }
+
+    private void requestVoteFromPeer(
+            RaftPeer peer,
+            RequestVoteRequest request,
+            AtomicInteger votesReceived,
+            int requiredVotes,
+            CountDownLatch votingComplete) {
+
+        for (int attempt = 0; attempt < RETRY_ATTEMPTS; attempt++) {
+            try {
+                RequestVoteResponse response = peer.requestVote(request);
+                handleVoteResponse(response, votesReceived, requiredVotes);
+                break;
+            } catch (Exception e) {
+                if (attempt == RETRY_ATTEMPTS - 1) {
+                    log.warn("Failed to get vote from peer {}: {}",
+                            peer.getId(), e.getMessage());
+                } else {
+                    try {
+                        Thread.sleep(CONNECT_RETRY_DELAY_MS);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        break;
+                    }
+                }
+            } finally {
+                if (attempt == RETRY_ATTEMPTS - 1) {
+                    votingComplete.countDown();
+                }
+            }
+        }
+    }
+
+    private synchronized void handleVoteResponse(
+            RequestVoteResponse response,
+            AtomicInteger votesReceived,
+            int majority) {
+
+        if (state != NodeState.CANDIDATE) {
+            return;
+        }
+
+        if (response.term > currentTerm.get()) {
+            stepDown(response.term);
+            return;
+        }
+
+        if (response.voteGranted && votesReceived.incrementAndGet() >= majority) {
+            becomeLeader();
+        }
+    }
+
+    // Leader Methods
+    private synchronized void becomeLeader() {
+        if (state == NodeState.LEADER) {
+            return;
+        }
+
+        log.info("Node {} becoming leader for term {}", nodeId, currentTerm.get());
+        state = NodeState.LEADER;
+        currentLeader = nodeId;
+        stopElectionTimer();
+
+        long lastIndex = logStore.getLastIndex();
+        for (RaftPeer peer : peers) {
+            peer.setNextIndex(lastIndex + 1);
+            peer.setMatchIndex(0);
+        }
+
+        sendHeartbeat();
+
         if (leaderChangeListener != null) {
             leaderChangeListener.onLeaderChange(nodeId);
         }
 
-        // 开始发送心跳
-        sendHeartbeat();
+        scheduler.scheduleAtFixedRate(
+                this::sendHeartbeat,
+                0,
+                HEARTBEAT_INTERVAL,
+                TimeUnit.MILLISECONDS
+        );
     }
 
     private void sendHeartbeat() {
+        if (state != NodeState.LEADER) {
+            return;
+        }
+
         for (RaftPeer peer : peers) {
             if (peer.getId().equals(nodeId)) {
                 continue;
             }
 
-            AppendEntriesRequest request = new AppendEntriesRequest(
-                    currentTerm.get(),
-                    nodeId,
-                    logStore.getLastIndex(),
-                    logStore.getLastTerm(),
-                    null,  // 心跳不包含日志条目
-                    commitIndex
-            );
-
-            scheduler.execute(() -> {
-                try {
-                    peer.appendEntries(request);
-                } catch (Exception e) {
-                    // 处理心跳发送失败
-                }
-            });
+            rpcExecutor.execute(() -> sendHeartbeatToPeer(peer));
         }
     }
 
-    private void handleAppendEntriesResponse(
-            RaftPeer peer,
-            AppendEntriesResponse response,
-            List<LogEntry> entries) throws Exception {
-
-        if (response.isSuccess()) {
-            // 更新peer的复制进度
-            peer.setNextIndex(peer.getNextIndex() + entries.size());
-            peer.setMatchIndex(peer.getNextIndex() - 1);
-
-            // 检查是否可以提交新的日志
-            updateCommitIndex();
-        } else {
-            // 如果失败，减少nextIndex重试
-            peer.setNextIndex(peer.getNextIndex() - 1);
-        }
-    }
-
-    private void updateCommitIndex() throws Exception {
-        for (long n = commitIndex + 1; n <= logStore.getLastIndex(); n++) {
-            if (logStore.getEntry(n).getTerm() == currentTerm.get()) {
-                int matchCount = 1;  // 包括自己
-                for (RaftPeer peer : peers) {
-                    if (peer.getMatchIndex() >= n) {
-                        matchCount++;
+    private void sendHeartbeatToPeer(RaftPeer peer) {
+        for (int attempt = 0; attempt < MAX_RETRY_ATTEMPTS; attempt++) {
+            try {
+                AppendEntriesRequest request = createHeartbeatRequest(peer);
+                AppendEntriesResponse response = peer.appendEntries(request);
+                handleHeartbeatResponse(peer, response);
+                return;
+            } catch (Exception e) {
+                log.warn("Heartbeat to {} failed, attempt {}/{}",
+                        peer.getId(), attempt + 1, MAX_RETRY_ATTEMPTS);
+                if (attempt < MAX_RETRY_ATTEMPTS - 1) {
+                    try {
+                        Thread.sleep(RETRY_DELAY_MS);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        break;
                     }
-                }
-
-                if (matchCount > peers.size() / 2) {
-                    commitIndex = n;
-                    applyLogEntries();
                 }
             }
         }
+    }
+
+    private synchronized void handleHeartbeatResponse(RaftPeer peer, AppendEntriesResponse response) {
+        if (state != NodeState.LEADER) {
+            return;
+        }
+
+        try {
+            if (response.term > currentTerm.get()) {
+                stepDown(response.term);
+                return;
+            }
+
+            lastHeartbeatTime.put(peer.getId(), System.currentTimeMillis());
+
+            if (response.success) {
+                long lastIndex = logStore.getLastIndex();
+                peer.setNextIndex(lastIndex + 1);
+                peer.setMatchIndex(lastIndex);
+                log.debug("Heartbeat successful to peer {}", peer.getId());
+            } else {
+                decrementNextIndex(peer);
+                replicateLog(peer);
+            }
+        } catch (Exception e) {
+            log.error("Error handling heartbeat response from peer {}: {}",
+                    peer.getId(), e.getMessage());
+        }
+    }
+
+    // Log Replication Methods
+    private void replicateLog(RaftPeer peer) {
+        long nextIndex = peer.getNextIndex();
+
+        for (int attempt = 0; attempt < RETRY_ATTEMPTS; attempt++) {
+            try {
+                List<com.kv.server.consensus.LogEntry> entries =
+                        fetchLogEntries(nextIndex, logStore.getLastIndex());
+
+                if (entries.isEmpty()) {
+                    return;
+                }
+
+                AppendEntriesRequest request = createAppendEntriesRequest(nextIndex - 1, entries);
+
+                CompletableFuture.runAsync(() -> {
+                    try {
+                        AppendEntriesResponse response = peer.appendEntries(request);
+                        handleAppendEntriesResponse(peer, response, entries);
+                    } catch (Exception e) {
+                        handleReplicationFailure(peer, e);
+                    }
+                }, rpcExecutor);
+
+                return;
+            } catch (Exception e) {
+                log.warn("Failed to replicate log to peer {}, attempt {}/{}: {}",
+                        peer.getId(), attempt + 1, RETRY_ATTEMPTS, e.getMessage());
+
+                if (attempt == RETRY_ATTEMPTS - 1) {
+                    handleReplicationFailure(peer, e);
+                } else {
+                    try {
+                        Thread.sleep(RETRY_DELAY_MS);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    private List<com.kv.server.consensus.LogEntry> fetchLogEntries(long fromIndex, long toIndex)
+            throws Exception {
+        List<com.kv.server.consensus.LogEntry> entries = new ArrayList<>();
+        try {
+            for (long i = fromIndex; i <= toIndex; i++) {
+                com.kv.server.consensus.LogEntry entry = logStore.getEntry(i);
+                if (entry != null) {
+                    entries.add(entry);
+                }
+            }
+            return entries;
+        } catch (Exception e) {
+            log.error("Failed to fetch log entries from {} to {}: {}",
+                    fromIndex, toIndex, e.getMessage());
+            throw e;
+        }
+    }
+
+    private AppendEntriesRequest createAppendEntriesRequest(
+            long prevLogIndex,
+            List<com.kv.server.consensus.LogEntry> entries) {
+        List<LogEntry> thriftEntries = entries.stream()
+                .map(entry -> new LogEntry(
+                        entry.getIndex(),
+                        entry.getTerm(),
+                        ByteBuffer.wrap(entry.getCommand())))
+                .collect(Collectors.toList());
+
+        return new AppendEntriesRequest(
+                currentTerm.get(),
+                nodeId,
+                prevLogIndex,
+                logStore.getTermForIndex(prevLogIndex),
+                thriftEntries,
+                commitIndex
+        );
+    }
+
+    private AppendEntriesRequest createHeartbeatRequest(RaftPeer peer) {
+        return new AppendEntriesRequest(
+                currentTerm.get(),
+                nodeId,
+                peer.getNextIndex() - 1,
+                logStore.getTermForIndex(peer.getNextIndex() - 1),
+                Collections.emptyList(),
+                commitIndex
+        );
+    }
+
+    private synchronized void handleAppendEntriesResponse(
+            RaftPeer peer,
+            AppendEntriesResponse response,
+            List<com.kv.server.consensus.LogEntry> entries) throws Exception {
+
+        if (response.term > currentTerm.get()) {
+            stepDown(response.term);
+            return;
+        }
+
+        if (state != NodeState.LEADER) {
+            return;
+        }
+
+        if (response.success) {
+            updatePeerProgress(peer, entries);
+            updateCommitIndex();
+        } else {
+            decrementNextIndex(peer);
+            replicateLog(peer);
+        }
+    }
+
+    private void updatePeerProgress(RaftPeer peer, List<com.kv.server.consensus.LogEntry> entries) {
+        if (!entries.isEmpty()) {
+            long lastIndex = entries.get(entries.size() - 1).getIndex();
+            peer.setMatchIndex(lastIndex);
+            peer.setNextIndex(lastIndex + 1);
+        }
+    }
+
+    private void decrementNextIndex(RaftPeer peer) {
+        long nextIndex = peer.getNextIndex();
+        peer.setNextIndex(Math.max(1, nextIndex - 1));
+    }
+
+    private void handleReplicationFailure(RaftPeer peer, Exception e) {
+        log.error("Log replication failed for peer {}: {}", peer.getId(), e.getMessage());
+        decrementNextIndex(peer);
+        tryReconnectPeer(peer);
+    }
+
+    private synchronized void updateCommitIndex() throws Exception {
+        long newCommitIndex = commitIndex;
+        for (long n = commitIndex + 1; n <= logStore.getLastIndex(); n++) {
+            if (isEntryCommitable(n)) {
+                newCommitIndex = n;
+            } else {
+                break;
+            }
+        }
+
+        if (newCommitIndex > commitIndex) {
+            commitIndex = newCommitIndex;
+            applyLogEntries();
+        }
+    }
+
+    private boolean isEntryCommitable(long index) throws Exception {
+        int matchCount = 1; // Include self
+        for (RaftPeer peer : peers) {
+            if (peer.getMatchIndex() >= index) {
+                matchCount++;
+            }
+        }
+        return matchCount > peers.size() / 2 &&
+                logStore.getTermForIndex(index) == currentTerm.get();
     }
 
     private void applyLogEntries() throws Exception {
         while (lastApplied < commitIndex) {
             lastApplied++;
-            LogEntry entry = logStore.getEntry(lastApplied);
-            stateMachine.apply(entry);
-
-            // 完成等待的提议
-            CompletableFuture<Boolean> future =
-                    pendingProposals.remove(entry.getIndex());
-            if (future != null) {
-                future.complete(true);
-            }
-        }
-    }
-
-    public void stop() {
-        try {
-            // 取消选举定时器
-            if (electionTimer != null) {
-                electionTimer.cancel(true);
-            }
-
-            // 关闭调度器
-            if (scheduler != null) {
-                scheduler.shutdown();
+            com.kv.server.consensus.LogEntry entry = logStore.getEntry(lastApplied);
+            if (entry != null) {
                 try {
-                    if (!scheduler.awaitTermination(5, TimeUnit.SECONDS)) {
-                        scheduler.shutdownNow();
-                    }
-                } catch (InterruptedException e) {
-                    scheduler.shutdownNow();
-                    Thread.currentThread().interrupt();
+                    stateMachine.apply(entry);
+                    completePendingProposal(entry);
+                } catch (Exception e) {
+                    log.error("Failed to apply log entry {}: {}", entry.getIndex(), e.getMessage());
+                    throw e;
                 }
             }
-
-            // 关闭状态机
-            if (stateMachine != null) {
-                stateMachine.close();
-            }
-
-            // 关闭日志存储
-            if (logStore != null) {
-                logStore.close();
-            }
-
-            // 完成所有待处理的提议
-            for (CompletableFuture<Boolean> future : pendingProposals.values()) {
-                future.completeExceptionally(new IllegalStateException("Node is shutting down"));
-            }
-            pendingProposals.clear();
-
-        } catch (Exception e) {
-            throw new RuntimeException("Failed to stop RaftNode", e);
         }
     }
 
-    public void start() {
-        // 启动心跳检测
-        scheduler.scheduleWithFixedDelay(
-                this::checkHeartbeat,
-                0,
-                100,
-                TimeUnit.MILLISECONDS
-        );
-
-        // 启动选举超时检测
-        resetElectionTimer();
+    private void completePendingProposal(com.kv.server.consensus.LogEntry entry) {
+        CompletableFuture<Boolean> future = pendingProposals.remove(entry.getIndex());
+        if (future != null) {
+            future.complete(true);
+        }
     }
 
-    /**
-     * Proposes a new command to the Raft cluster.
-     *
-     * @param command The command to be replicated
-     * @return A future that completes when the command is committed
-     * @throws Exception if the proposal fails
-     */
+    // Timer Management Methods
+    private final Object electionTimerLock = new Object();
+
+    private void resetElectionTimer() {
+        synchronized(electionTimerLock) {
+            long now = System.currentTimeMillis();
+            // 避免频繁重置
+            if (now - lastElectionTimerReset < ELECTION_TIMER_RESET_MIN_INTERVAL) {
+                log.debug("Skipping election timer reset - too soon since last reset");
+                return;
+            }
+
+            stopElectionTimer();
+
+            // 使用更小的随机范围
+            int randomTimeout = ELECTION_TIMEOUT_MIN +
+                    random.nextInt(ELECTION_TIMEOUT_MAX - ELECTION_TIMEOUT_MIN);
+
+            electionTimer = scheduler.schedule(
+                    () -> {
+                        try {
+                            if (state != NodeState.LEADER) {  // 添加状态检查
+                                startElection();
+                            }
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                            log.warn("Election timer interrupted", e);
+                        }
+                    },
+                    randomTimeout,
+                    TimeUnit.MILLISECONDS
+            );
+
+            lastElectionTimerReset = now;
+            log.debug("Election timer reset with timeout: {}ms", randomTimeout);
+        }
+    }
+
+    private boolean isElectionTimerActive() {
+        return electionTimer != null && !electionTimer.isDone() && !electionTimer.isCancelled();
+    }
+
+
+    private void stopElectionTimer() {
+        if (electionTimer != null) {
+            electionTimer.cancel(true);
+            electionTimer = null;
+        }
+    }
+
+    // Health Check Methods
+    private void checkHeartbeat() {
+        if (state != NodeState.LEADER) {
+            return;
+        }
+        checkPeerHealth();
+    }
+
+
+
+    private void tryReconnectPeer(RaftPeer peer) {
+        rpcExecutor.execute(() -> {
+            for (int attempt = 0; attempt < MAX_RETRY_ATTEMPTS; attempt++) {
+                try {
+                    AppendEntriesRequest request = createHeartbeatRequest(peer);
+                    AppendEntriesResponse response = peer.appendEntries(request);
+                    if (response != null) {
+                        log.info("Successfully reconnected to peer {}", peer.getId());
+                        return;
+                    }
+                } catch (Exception e) {
+                    log.warn("Failed to reconnect to peer {}, attempt {}/{}",
+                            peer.getId(), attempt + 1, MAX_RETRY_ATTEMPTS);
+                    if (attempt < MAX_RETRY_ATTEMPTS - 1) {
+                        try {
+                            Thread.sleep(CONNECT_RETRY_DELAY_MS);
+                        } catch (InterruptedException ie) {
+                            Thread.currentThread().interrupt();
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+    }
+    // RPC Interface Methods
+    @Override
+    public synchronized RequestVoteResponse requestVote(RequestVoteRequest request)
+            throws TException {
+        log.debug("Received vote request from {} for term {}",
+                request.candidateId, request.term);
+
+        // 先检查任期
+        if (request.term < currentTerm.get()) {
+            return new RequestVoteResponse(currentTerm.get(), false);
+        }
+
+        // 如果请求的任期更大，立即转为 follower
+        if (request.term > currentTerm.get()) {
+            stepDown(request.term);
+        }
+
+        // 检查是否已经投票给其他节点
+        if (votedFor != null && !votedFor.equals(request.candidateId)
+                && request.term == currentTerm.get()) {
+            return new RequestVoteResponse(currentTerm.get(), false);
+        }
+
+        // 检查日志是否最新
+        if (!isLogUpToDate(request.lastLogIndex, request.lastLogTerm)) {
+            return new RequestVoteResponse(currentTerm.get(), false);
+        }
+
+        // 授予投票
+        votedFor = request.candidateId;
+        resetElectionTimer();  // 重置选举定时器
+
+        log.info("Granted vote to {} for term {}", request.candidateId, request.term);
+        return new RequestVoteResponse(currentTerm.get(), true);
+    }
+
+    private boolean isLogUpToDate(long lastLogIndex, long lastLogTerm) {
+        long myLastLogTerm = logStore.getLastTerm();
+        long myLastLogIndex = logStore.getLastIndex();
+
+        if (lastLogTerm != myLastLogTerm) {
+            return lastLogTerm > myLastLogTerm;
+        }
+        return lastLogIndex >= myLastLogIndex;
+    }
+
+    @Override
+    public synchronized AppendEntriesResponse appendEntries(AppendEntriesRequest request)
+            throws TException {
+        try {
+            if (request.term < currentTerm.get()) {
+                return new AppendEntriesResponse(currentTerm.get(), false);
+            }
+
+            resetElectionTimer();
+
+            if (request.term > currentTerm.get()) {
+                stepDown(request.term);
+            }
+
+            currentLeader = request.leaderId;
+
+            if (!logStore.containsEntry(request.prevLogIndex, request.prevLogTerm)) {
+                return new AppendEntriesResponse(currentTerm.get(), false);
+            }
+
+            processLogEntries(request);
+            updateCommitIndexFromLeader(request.leaderCommit);
+
+            return new AppendEntriesResponse(currentTerm.get(), true);
+        } catch (Exception e) {
+            log.error("Error processing AppendEntries request: {}", e.getMessage());
+            return new AppendEntriesResponse(currentTerm.get(), false);
+        }
+    }
+
+    // Log Processing Methods
+    private void processLogEntries(AppendEntriesRequest request) throws Exception {
+        if (request.entries != null && !request.entries.isEmpty()) {
+            List<com.kv.server.consensus.LogEntry> entries =
+                    convertThriftEntries(request.entries);
+            logStore.append(entries);
+        }
+    }
+
+    private List<com.kv.server.consensus.LogEntry> convertThriftEntries(
+            List<LogEntry> thriftEntries) {
+        return thriftEntries.stream()
+                .map(entry -> new com.kv.server.consensus.LogEntry(
+                        entry.index,
+                        entry.term,
+                        entry.command.array()))
+                .collect(Collectors.toList());
+    }
+
+    private void updateCommitIndexFromLeader(long leaderCommit) throws Exception {
+        if (leaderCommit > commitIndex) {
+            commitIndex = Math.min(leaderCommit, logStore.getLastIndex());
+            applyLogEntries();
+        }
+    }
+
+    // Command Proposal
     public CompletableFuture<Boolean> propose(byte[] command) throws Exception {
         if (state != NodeState.LEADER) {
             throw new IllegalStateException("Not the leader");
         }
 
-        // Create log entry
-        LogEntry entry = new LogEntry(
+        com.kv.server.consensus.LogEntry entry = new com.kv.server.consensus.LogEntry(
                 logStore.getLastIndex() + 1,
                 currentTerm.get(),
                 command
         );
 
-        // Store locally
-        logStore.append(entry);
-
-        // Create future for tracking completion
-        CompletableFuture<Boolean> future = new CompletableFuture<>();
-        pendingProposals.put(entry.getIndex(), future);
-
-        // Replicate to peers
-        for (RaftPeer peer : peers) {
-            if (peer.getId().equals(nodeId)) {
-                continue;
-            }
-
-            replicateLog(peer);
-        }
-
-        return future;
-    }
-
-    private void replicateLog(RaftPeer peer) {
-        long nextIndex = peer.getNextIndex();
-        List<LogEntry> entries = new ArrayList<>();
-
         try {
-            for (long i = nextIndex; i <= logStore.getLastIndex(); i++) {
-                entries.add(logStore.getEntry(i));
+            logStore.append(Collections.singletonList(entry));
+            CompletableFuture<Boolean> future = new CompletableFuture<>();
+            pendingProposals.put(entry.getIndex(), future);
+
+            for (RaftPeer peer : peers) {
+                if (!peer.getId().equals(nodeId)) {
+                    replicateLog(peer);
+                }
             }
 
-            if (!entries.isEmpty()) {
-                AppendEntriesRequest request = new AppendEntriesRequest(
-                        currentTerm.get(),
-                        nodeId,
-                        nextIndex - 1,
-                        logStore.getEntry(nextIndex - 1).getTerm(),
-                        entries,
-                        commitIndex
-                );
-
-                scheduler.execute(() -> {
-                    try {
-                        AppendEntriesResponse response = peer.appendEntries(request);
-                        handleAppendEntriesResponse(peer, response, entries);
-                    } catch (Exception e) {
-                        // Handle replication failure
-                    }
-                });
-            }
+            return future;
         } catch (Exception e) {
-            // Handle log access failure
+            log.error("Failed to propose command: {}", e.getMessage());
+            throw e;
         }
     }
 
-    public interface LeaderChangeListener {
-        void onLeaderChange(String newLeaderId);
+    // Lifecycle Methods
+    public void start() {
+        try {
+            startRaftServer();
+            startHeartbeatAndElection();
+            log.info("RaftNode started successfully");
+        } catch (Exception e) {
+            log.error("Failed to start RaftNode", e);
+            throw new RuntimeException("Failed to start Raft server", e);
+        }
     }
-}
+
+    private void startHeartbeatAndElection() {
+        scheduler.scheduleWithFixedDelay(
+                this::checkHeartbeat,
+                HEARTBEAT_INTERVAL,
+                HEARTBEAT_INTERVAL,
+                TimeUnit.MILLISECONDS
+        );
+        resetElectionTimer();
+    }
+
+    public void stop() {
+        try {
+            stopServices();
+            closeResources();
+            handlePendingProposals();
+            log.info("RaftNode stopped successfully");
+        } catch (Exception e) {
+            log.error("Error stopping RaftNode", e);
+            throw new RuntimeException("Failed to stop RaftNode", e);
+        }
+    }
+
+    private void stopServices() {
+        if (raftServer != null) {
+            raftServer.stop();
+        }
+
+        stopElectionTimer();
+        shutdownExecutor(scheduler, "Scheduler");
+        shutdownExecutor(rpcExecutor, "RPC Executor");
+    }
+
+    private void shutdownExecutor(ExecutorService executor, String name) {
+        if (executor != null) {
+            executor.shutdown();
+            try {
+                if (!executor.awaitTermination(5, TimeUnit.SECONDS)) {
+                    executor.shutdownNow();
+                }
+            } catch (InterruptedException e) {
+                executor.shutdownNow();
+                Thread.currentThread().interrupt();
+                log.warn("{} shutdown interrupted", name);
+            }
+        }
+    }
+
+    private void closeResources() throws IOException {
+        if (stateMachine != null) {
+            stateMachine.close();
+        }
+
+        if (logStore != null) {
+            logStore.close();
+        }
+    }
+
+    private void handlePendingProposals() {
+        for (CompletableFuture<Boolean> future : pendingProposals.values()) {
+            future.completeExceptionally(
+                    new IllegalStateException("Node is shutting down")
+            );
+        }
+        pendingProposals.clear();
+    }
+
+    // Utility Methods
+    private synchronized void stepDown(long newTerm) {
+        if (currentTerm.get() >= newTerm) {
+            return;  // 如果当前term已经大于等于新term，不需要stepDown
+        }
+
+        log.info("Node {} stepping down in term {}", nodeId, newTerm);
+        stopElectionTimer();
+        state = NodeState.FOLLOWER;
+        currentTerm.set(newTerm);
+        votedFor = null;
+        currentLeader = null;
+        resetElectionTimer();  // 只调用一次
+    }
+
+        public void setLeaderChangeListener(LeaderChangeListener listener) {
+            this.leaderChangeListener = listener;
+        }
+
+        public interface LeaderChangeListener {
+            void onLeaderChange(String newLeaderId);
+        }
+
+        private enum NodeState {
+            FOLLOWER,
+            CANDIDATE,
+            LEADER
+        }
+    }

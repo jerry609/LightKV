@@ -250,3 +250,5 @@ String value = client.get("key");
 ![img_2.png](img_2.png)
 
 ![img_3.png](img_3.png)
+选举成功
+![img_4.png](img_4.png)

@@ -33,6 +33,8 @@ public class KVStateMachine implements StateMachine {
                 case DELETE:
                     storage.delete(op.getKey().getBytes());
                     break;
+                default:
+                    throw new IllegalArgumentException("Unsupported operation type");
             }
             lastApplied = entry.getIndex();
         } finally {
