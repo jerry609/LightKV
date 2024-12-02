@@ -29,6 +29,7 @@ public class KVServer {
         try (FileInputStream fis = new FileInputStream(configPath)) {
             config.load(fis);
         }
+
         // 初始化节点ID
         this.nodeId = config.getProperty("node.id");
 
@@ -38,15 +39,18 @@ public class KVServer {
         // 初始化Raft peers
         List<RaftPeer> peers = loadPeersFromConfig(config);
 
-        // 创建Raft节点
-        this.raftNode = new RaftNode(nodeId, peers);
+        // 获取RocksDB路径
+        String dbPath = config.getProperty("rocksdb.path", "/Users/jerry/data/" + nodeId + "/raft-log");
+
+        // 创建Raft节点，传入dbPath
+        this.raftNode = new RaftNode(nodeId, peers, dbPath);  // 修复了这里的dbPath参数
 
         // 创建路由管理器
         this.routerManager = new RouterManager(metadataManager, replicaCount);
 
         // 注册Raft状态变更监听器
         raftNode.setLeaderChangeListener(newLeaderId ->
-            metadataManager.updateLeader(newLeaderId));
+                metadataManager.updateLeader(newLeaderId));
     }
 
     private List<RaftPeer> loadPeersFromConfig(Properties config) {
@@ -88,28 +92,31 @@ public class KVServer {
         }
     }
 
-    public static void main(String[] args) throws Exception {
-//        if (args.length != 3) {
-//            System.out.println("Usage: KVServer <config_path> <port> <replica_count>");
-//            System.exit(1);
-//        }
-//
-//        String configPath = args[0];
-//        int port = Integer.parseInt(args[1]);
-//        int replicaCount = Integer.parseInt(args[2]);
-        System.out.println("Current working directory: " + System.getProperty("user.dir"));
-        String configPath="./kv-server/config.properties";
-        int port=8090;
-        int replicaCount=3;
+    public static void main(String[] args) {
         try {
+            if (args.length != 1) {
+                System.out.println("Usage: KVServer <config_path>");
+                System.exit(1);
+            }
+
+            String configPath = args[0];
+
+            // 从配置文件读取端口和副本数
+            Properties config = new Properties();
+            try (FileInputStream fis = new FileInputStream(configPath)) {
+                config.load(fis);
+            }
+
+            int port = Integer.parseInt(config.getProperty("server.port"));
+            int replicaCount = Integer.parseInt(config.getProperty("replica.count", "3"));
+
+            // 创建并启动服务器
             KVServer server = new KVServer(configPath, port, replicaCount);
-
-            // 注册关闭钩子
-            Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-                server.stop();
-            }));
-
             server.start();
+
+            // 添加关闭钩子
+            Runtime.getRuntime().addShutdownHook(new Thread(server::stop));
+
         } catch (Exception e) {
             System.err.println("Failed to start KVServer: " + e.getMessage());
             e.printStackTrace();

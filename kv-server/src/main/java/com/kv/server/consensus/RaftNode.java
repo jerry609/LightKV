@@ -4,6 +4,7 @@ package com.kv.server.consensus;
 import com.kv.server.storage.LogStore;
 import lombok.Getter;
 
+import java.io.File;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.*;
@@ -39,11 +40,22 @@ public class RaftNode {
     private volatile long lastApplied;
     private LeaderChangeListener leaderChangeListener;
 
-    public RaftNode(String nodeId, List<RaftPeer> peers) {
+    public RaftNode(String nodeId, List<RaftPeer> peers, String dbPath) {
         this.nodeId = nodeId;
         this.peers = peers;
-        this.logStore = new RocksDBLogStore();
-        this.stateMachine = new KVStateMachine();
+
+        // 创建日志和状态机的目录路径
+        String logPath = dbPath + File.separator + "log";
+        String statePath = dbPath + File.separator + "state";
+
+        // 确保父目录存在
+        File baseDir = new File(dbPath);
+        if (!baseDir.exists() && !baseDir.mkdirs()) {
+            throw new RuntimeException("Failed to create base directory: " + dbPath);
+        }
+
+        this.logStore = new RocksDBLogStore(logPath);
+        this.stateMachine = new KVStateMachine(statePath);
         this.scheduler = Executors.newScheduledThreadPool(2);
         this.state = NodeState.FOLLOWER;
         this.currentTerm = new AtomicLong(0);
@@ -52,7 +64,6 @@ public class RaftNode {
         this.commitIndex = 0;
         this.lastApplied = 0;
     }
-
     public void setLeaderChangeListener(LeaderChangeListener listener) {
         this.leaderChangeListener = listener;
     }

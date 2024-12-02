@@ -11,8 +11,8 @@ public class KVStateMachine implements StateMachine {
     private final ReentrantReadWriteLock lock;
     private volatile long lastApplied;
 
-    public KVStateMachine() {
-        this.storage = new RocksDBStorage();
+    public KVStateMachine(String dbPath) {
+        this.storage = new RocksDBStorage(dbPath);
         this.lock = new ReentrantReadWriteLock();
         this.lastApplied = 0;
     }

@@ -1,7 +1,5 @@
 package com.kv.client;
 
-import com.kv.client.KVClient;
-
 import java.nio.ByteBuffer;
 import java.util.Scanner;
 
@@ -18,7 +16,6 @@ public class KVCommandClient implements AutoCloseable {
     public void close() throws Exception {
         scanner.close();
         if (client != null) {
-            // Assuming KVClient has a close method
             client.close();
         }
     }
@@ -71,11 +68,13 @@ public class KVCommandClient implements AutoCloseable {
     }
 
     private void handleGet(String key) throws Exception {
-        byte[] value = client.get(key.getBytes()).array();
+        ByteBuffer value = client.get(key.getBytes());
         if (value == null) {
             System.out.println("Key not found: " + key);
         } else {
-            System.out.println("Value: " + new String(value));
+            byte[] bytes = new byte[value.remaining()];
+            value.get(bytes);
+            System.out.println("Value: " + new String(bytes));
         }
     }
 
@@ -90,17 +89,23 @@ public class KVCommandClient implements AutoCloseable {
     }
 
     public static void main(String[] args) {
-//        if (args.length != 2) {
-//            System.out.println("Usage: KVCommandClient <host> <port>");
-//            System.exit(1);
-//        }
-//
-//        String host = args[0];
-//        int port = Integer.parseInt(args[1]);
-        String host="127.0.0.1";
-        int port=8090;
-        try (KVCommandClient cli = new KVCommandClient(host, port)) {
-            cli.start();
+        if (args.length != 2) {
+            System.out.println("Usage: KVCommandClient <host> <port>");
+            System.exit(1);
+        }
+
+        String host = args[0];
+        int port;
+        try {
+            port = Integer.parseInt(args[1]);
+        } catch (NumberFormatException e) {
+            System.err.println("Error: Port must be a number");
+            System.exit(1);
+            return;
+        }
+
+        try (KVCommandClient client = new KVCommandClient(host, port)) {
+            client.start();
         } catch (Exception e) {
             System.err.println("Error: " + e.getMessage());
             System.exit(1);

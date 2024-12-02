@@ -25,8 +25,10 @@ public class RocksDBStorage implements KVStorage {
     private static final double DEFAULT_FPP = 0.01;
     private static final int DEFAULT_MAXIMUM_CACHE_SIZE = 10_000;
     private static final int DEFAULT_TIME_LIMIT = 10;
+    private final String dbPath;
 
-    public RocksDBStorage() {
+    public RocksDBStorage(String dbPath) {
+        this.dbPath = dbPath;
         Options options = new Options()
                 .setCreateIfMissing(true)
                 .setWriteBufferSize(64 * 1024 * 1024)
@@ -35,7 +37,7 @@ public class RocksDBStorage implements KVStorage {
 
         try {
             RocksDB.loadLibrary();
-            db = RocksDB.open(options, "rocksdb-data");
+            db = RocksDB.open(options, this.dbPath);
             bloomFilter = new BloomFilterImpl(DEFAULT_EXPECTED_INSERTIONS, DEFAULT_FPP);
             this.cache = CacheBuilder.newBuilder()
                     .maximumSize(DEFAULT_MAXIMUM_CACHE_SIZE)
@@ -152,6 +154,29 @@ public class RocksDBStorage implements KVStorage {
     public void close() throws IOException {
         if (db != null) {
             db.close();
+        }
+    }
+
+    // BloomFilterImpl inner class
+    private static class BloomFilterImpl implements BloomFilterService {
+        private final BloomFilter<byte[]> filter;
+
+        public BloomFilterImpl(int expectedInsertions, double falsePositiveRate) {
+            this.filter = BloomFilter.create(
+                    Funnels.byteArrayFunnel(),
+                    expectedInsertions,
+                    falsePositiveRate
+            );
+        }
+
+        @Override
+        public void add(byte[] key) {
+            filter.put(key);
+        }
+
+        @Override
+        public boolean mightContain(byte[] key) {
+            return filter.mightContain(key);
         }
     }
 }

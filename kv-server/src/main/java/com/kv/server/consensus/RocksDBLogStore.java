@@ -4,6 +4,8 @@ package com.kv.server.consensus;
 import com.kv.server.storage.LogStore;
 import org.rocksdb.*;
 
+import java.io.File;
+import java.io.IOException;
 import java.util.*;
 import java.nio.ByteBuffer;
 
@@ -11,16 +13,35 @@ public class RocksDBLogStore implements LogStore {
     private final RocksDB db;
     private volatile long lastIndex;
     private volatile long commitIndex;
-
-    public RocksDBLogStore() {
+    private final String dbPath;
+    public RocksDBLogStore(String dbPath) {
+        this.dbPath = dbPath;
         try {
-            RocksDB.loadLibrary();
+            // 确保目录存在
+            File directory = new File(dbPath);
+            if (directory.exists() && !directory.isDirectory()) {
+                // 如果存在但不是目录，先删除
+                if (!directory.delete()) {
+                    throw new RuntimeException("Failed to delete existing file: " + dbPath);
+                }
+            }
+            // 创建目录及其父目录
+            if (!directory.exists() && !directory.mkdirs()) {
+                throw new RuntimeException("Failed to create directory: " + dbPath);
+            }
+
+            // 配置 RocksDB
             Options options = new Options()
-                    .setCreateIfMissing(true);
-            db = RocksDB.open(options, "raft-log");
-            initializeLastIndex();
+                    .setCreateIfMissing(true)
+                    .setWriteBufferSize(64 * 1024 * 1024)
+                    .setMaxWriteBufferNumber(3)
+                    .setMaxBackgroundCompactions(10);
+
+            // 初始化 RocksDB
+            RocksDB.loadLibrary();
+            db = RocksDB.open(options, dbPath);
         } catch (RocksDBException e) {
-            throw new RuntimeException("Failed to initialize RocksDB", e);
+            throw new RuntimeException("Failed to initialize RocksDB at path: " + dbPath, e);
         }
     }
 

@@ -9,10 +9,10 @@ NODE_ID=$1
 CONFIG_PATH=$2
 
 # 设置CLASSPATH
-CLASSPATH="lib/*"
+CLASSPATH="/Users/jerry/lib/*"
 
 # 设置JVM参数
-JVM_OPTS="-Xms512m -Xmx1024m -XX:+UseG1GC"
+JVM_OPTS="-Xms512m -Xmx1024m -XX:+UnlockExperimentalVMOptions -XX:+UseG1GC"
 
 # 启动服务器
 java $JVM_OPTS -cp $CLASSPATH \
