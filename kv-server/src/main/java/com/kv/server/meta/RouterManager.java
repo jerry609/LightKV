@@ -43,18 +43,36 @@ public class RouterManager {
         // 清除旧的路由表
         routingTable.clear();
     }
-      /**
+    /**
+     * Gets the current leader node information.
+     *
+     * @return NodeInfo of the current leader, or null if no leader is available
+     */
+    public NodeInfo getLeaderNode() {
+        StorageNode leaderNode = metadataManager.getLeaderNode();
+        if (leaderNode == null) {
+            return null;
+        }
+        return new NodeInfo(
+                leaderNode.getNodeId(),
+                leaderNode.getHost(),
+                leaderNode.getPort(),
+                leaderNode.getStatus().name()
+        );
+    }
+
+    /**
      * Gets information about the local node.
      *
      * @return NodeInfo containing details about the local node
      */
-public NodeInfo getLocalNodeInfo() {
+    public NodeInfo getLocalNodeInfo() {
         StorageNode localNode = metadataManager.getLocalNode();
         return new NodeInfo(
-            localNode.getNodeId(),
-            localNode.getHost(),
-            localNode.getPort(),
-            localNode.getStatus().name()
+                localNode.getNodeId(),
+                localNode.getHost(),
+                localNode.getPort(),
+                localNode.getStatus().name()
         );
     }
     public StorageNode getNodeForKey(String key) {

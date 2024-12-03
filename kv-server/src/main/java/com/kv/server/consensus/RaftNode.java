@@ -116,7 +116,9 @@ public class RaftNode implements RaftService.Iface {
             throw new RuntimeException("Failed to create base directory: " + raftLogPath);
         }
     }
-
+    public boolean isLeader() {
+        return state == NodeState.LEADER;
+    }
     private boolean preVote() throws InterruptedException {
         AtomicInteger votesReceived = new AtomicInteger(1);
         CountDownLatch votingComplete = new CountDownLatch(peers.size());

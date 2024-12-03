@@ -5,6 +5,7 @@ import com.kv.server.meta.RouterManager;
 import com.kv.server.consensus.RaftNode;
 import com.kv.server.consensus.RaftPeer;
 import com.kv.thrift.KVService;
+import com.kv.thrift.KVServiceConfig;
 import com.kv.thrift.KVServiceImpl;
 import org.apache.thrift.server.TThreadPoolServer;
 import org.apache.thrift.transport.TServerSocket;
@@ -14,6 +15,7 @@ import java.util.List;
 import java.util.ArrayList;
 import java.util.Properties;
 import java.io.FileInputStream;
+import java.util.concurrent.TimeUnit;
 
 public class KVServer {
     private final String nodeId;
@@ -96,32 +98,52 @@ public class KVServer {
 
         return peers;
     }
+    private String getConfigValue(String key, String defaultValue) {
+        String value = config.getProperty(key, defaultValue);
+        // 如果值包含注释，只取注释前的部分
+        int commentIndex = value.indexOf('#');
+        if (commentIndex != -1) {
+            value = value.substring(0, commentIndex).trim();
+        }
+        return value;
+    }
 
     public void start() throws Exception {
         // Start Raft node
         raftNode.start();
 
-        // Create Thrift service handler
-        KVServiceImpl handler = new KVServiceImpl(routerManager, raftNode);
+        // Create KVServiceConfig using Builder pattern
+        KVServiceConfig serviceConfig = new KVServiceConfig.Builder()
+                .operationTimeout(
+                        Long.parseLong(getConfigValue("operation.timeout.ms", "5000")),
+                        TimeUnit.MILLISECONDS)
+                .minThreads(Integer.parseInt(getConfigValue("thread.pool.min", "4")))
+                .maxThreads(Integer.parseInt(getConfigValue("thread.pool.max", "32")))
+                .queueSize(Integer.parseInt(getConfigValue("thread.pool.queue.size", "1000")))
+                .maxKeyLength(Integer.parseInt(getConfigValue("max.key.length", "256")))
+                .maxValueSize(Integer.parseInt(getConfigValue("max.value.size", "1048576")))
+                .batchSize(Integer.parseInt(getConfigValue("batch.size", "100")))
+                .enableCompression(Boolean.parseBoolean(getConfigValue("enable.compression", "false")))
+                .build();
+
+        // Create Thrift service handler with config
+        KVServiceImpl handler = new KVServiceImpl(routerManager, raftNode, serviceConfig);
         KVService.Processor<KVServiceImpl> processor = new KVService.Processor<>(handler);
 
         // Start Thrift server for KV service
         TServerTransport serverTransport = new TServerSocket(kvPort);
 
-        // 从配置文件中读取线程池参数
-        int minThreads = Integer.parseInt(config.getProperty("thread.pool.min", "4"));
-        int maxThreads = Integer.parseInt(config.getProperty("thread.pool.max", "32"));
-
         TThreadPoolServer.Args args = new TThreadPoolServer.Args(serverTransport)
                 .processor(processor)
-                .minWorkerThreads(minThreads)
-                .maxWorkerThreads(maxThreads);
+                .minWorkerThreads(serviceConfig.getMinThreads())
+                .maxWorkerThreads(serviceConfig.getMaxThreads());
 
         TThreadPoolServer server = new TThreadPoolServer(args);
         System.out.println("KV Server started on port " + kvPort + " with nodeId: " + nodeId);
         System.out.println("Raft communication port: " + raftPort);
         server.serve();
     }
+
 
     public void stop() {
         if (raftNode != null) {
