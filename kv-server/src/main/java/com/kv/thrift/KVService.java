@@ -74,7 +74,6 @@ public class KVService {
     public boolean put(String key, java.nio.ByteBuffer value) throws KVServiceException, org.apache.thrift.TException
     {
       send_put(key, value);
-
       return recv_put();
     }
 
@@ -89,6 +88,7 @@ public class KVService {
     public boolean recv_put() throws KVServiceException, org.apache.thrift.TException
     {
       put_result result = new put_result();
+      System.out.println(result.toString());
       receiveBase(result, "put");
       System.out.println(result.toString());
       if (result.isSetSuccess()) {

@@ -69,10 +69,10 @@ public class KVServiceImpl implements KVService.Iface {
 
                 // 执行Put操作
                 byte[] command = CommandSerializer.serializePutCommand(key, value);
+                System.out.println(command);
                 CompletableFuture<Boolean> future = raftNode.propose(command);
-
+                System.out.println("future:"+future.join());
                 boolean result = future.get(config.getOperationTimeout(), TimeUnit.MILLISECONDS);
-
                 long duration = System.currentTimeMillis() - startTime;
                 logger.info("Put operation for key {} completed in {}ms on attempt {}",
                         key, duration, retries + 1);

@@ -9,3 +9,4 @@
 **/target/
 /raft-log
 /rocksdb-data
+/out

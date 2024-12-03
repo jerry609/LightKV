@@ -89,21 +89,22 @@ public class KVCommandClient implements AutoCloseable {
     }
 
     public static void main(String[] args) {
-        if (args.length != 2) {
-            System.out.println("Usage: KVCommandClient <host> <port>");
-            System.exit(1);
-        }
-
-        String host = args[0];
-        int port;
-        try {
-            port = Integer.parseInt(args[1]);
-        } catch (NumberFormatException e) {
-            System.err.println("Error: Port must be a number");
-            System.exit(1);
-            return;
-        }
-
+//        if (args.length != 2) {
+//            System.out.println("Usage: KVCommandClient <host> <port>");
+//            System.exit(1);
+//        }
+//
+//        String host = args[0];
+//        int port;
+//        try {
+//            port = Integer.parseInt(args[1]);
+//        } catch (NumberFormatException e) {
+//            System.err.println("Error: Port must be a number");
+//            System.exit(1);
+//            return;
+//        }
+    String host="127.0.0.1";
+    int port=18091;
         try (KVCommandClient client = new KVCommandClient(host, port)) {
             client.start();
         } catch (Exception e) {

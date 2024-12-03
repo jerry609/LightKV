@@ -8,14 +8,10 @@ import com.kv.thrift.RaftService;
 import com.kv.thrift.RequestVoteRequest;
 import com.kv.thrift.RequestVoteResponse;
 import lombok.Getter;
-import lombok.SneakyThrows;
 import org.apache.thrift.TException;
 import org.apache.thrift.protocol.TBinaryProtocol;
 import org.apache.thrift.server.TServer;
 import org.apache.thrift.server.TThreadPoolServer;
-import org.apache.thrift.transport.TServerSocket;
-import org.apache.thrift.transport.TServerTransport;
-import org.apache.thrift.transport.TTransportFactory;
 import org.apache.thrift.transport.layered.TFramedTransport;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -479,46 +475,60 @@ public class RaftNode implements RaftService.Iface {
     }
 
     // Log Replication Methods
-    private void replicateLog(RaftPeer peer) {
+    private CompletableFuture<Void> replicateLog(RaftPeer peer) {
         long nextIndex = peer.getNextIndex();
 
-        for (int attempt = 0; attempt < RETRY_ATTEMPTS; attempt++) {
-            try {
-                List<com.kv.server.consensus.LogEntry> entries =
-                        fetchLogEntries(nextIndex, logStore.getLastIndex());
+        // 创建一个 CompletableFuture 来处理该 peer 的复制任务
+        CompletableFuture<Void> replicationFuture = new CompletableFuture<>();
 
-                if (entries.isEmpty()) {
-                    return;
-                }
+        // 异步执行日志复制任务
+        CompletableFuture.runAsync(() -> {
+            for (int attempt = 0; attempt < RETRY_ATTEMPTS; attempt++) {
+                try {
+                    // 获取需要复制的日志条目
+                    List<com.kv.server.consensus.LogEntry> entries =
+                            fetchLogEntries(nextIndex, logStore.getLastIndex());
 
-                AppendEntriesRequest request = createAppendEntriesRequest(nextIndex - 1, entries);
-
-                CompletableFuture.runAsync(() -> {
-                    try {
-                        AppendEntriesResponse response = peer.appendEntries(request);
-                        handleAppendEntriesResponse(peer, response, entries);
-                    } catch (Exception e) {
-                        handleReplicationFailure(peer, e);
+                    if (entries.isEmpty()) {
+                        replicationFuture.complete(null); // 无日志需要复制，标记为完成
+                        return;
                     }
-                }, rpcExecutor);
 
-                return;
-            } catch (Exception e) {
-                log.warn("Failed to replicate log to peer {}, attempt {}/{}: {}",
-                        peer.getId(), attempt + 1, RETRY_ATTEMPTS, e.getMessage());
+                    // 创建附加条目的请求
+                    AppendEntriesRequest request = createAppendEntriesRequest(nextIndex - 1, entries);
 
-                if (attempt == RETRY_ATTEMPTS - 1) {
-                    handleReplicationFailure(peer, e);
-                } else {
-                    try {
-                        Thread.sleep(RETRY_DELAY_MS);
-                    } catch (InterruptedException ie) {
-                        Thread.currentThread().interrupt();
-                        break;
+                    // 发送异步请求
+                    AppendEntriesResponse response = peer.appendEntries(request);
+
+                    // 处理响应
+                    handleAppendEntriesResponse(peer, response, entries);
+
+                    // 复制成功，标记完成
+                    replicationFuture.complete(null);
+                    return;
+
+                } catch (Exception e) {
+                    log.warn("Failed to replicate log to peer {}, attempt {}/{}: {}",
+                            peer.getId(), attempt + 1, RETRY_ATTEMPTS, e.getMessage());
+
+                    if (attempt == RETRY_ATTEMPTS - 1) {
+                        // 如果所有尝试失败，标记为异常
+                        handleReplicationFailure(peer, e);
+                        replicationFuture.completeExceptionally(e);
+                    } else {
+                        try {
+                            Thread.sleep(RETRY_DELAY_MS);
+                        } catch (InterruptedException ie) {
+                            Thread.currentThread().interrupt();
+                            replicationFuture.completeExceptionally(ie);
+                            break;
+                        }
                     }
                 }
             }
-        }
+        }, rpcExecutor);
+
+        return replicationFuture;
     }
     private List<com.kv.server.consensus.LogEntry> fetchLogEntries(long fromIndex, long toIndex)
             throws Exception {
@@ -854,6 +864,7 @@ public class RaftNode implements RaftService.Iface {
             throw new IllegalStateException("Not the leader");
         }
 
+        // 创建一个新的日志条目
         com.kv.server.consensus.LogEntry entry = new com.kv.server.consensus.LogEntry(
                 logStore.getLastIndex() + 1,
                 currentTerm.get(),
@@ -861,16 +872,38 @@ public class RaftNode implements RaftService.Iface {
         );
 
         try {
+            // 将日志条目追加到日志存储中
             logStore.append(Collections.singletonList(entry));
+
+            // 创建一个新的 CompletableFuture 来等待日志复制的结果
             CompletableFuture<Boolean> future = new CompletableFuture<>();
+
+            // 将该条目的索引与 future 关联起来，存储在 pendingProposals 中
             pendingProposals.put(entry.getIndex(), future);
 
+            // 生成所有的复制操作任务
+            List<CompletableFuture<Void>> replicationFutures = new ArrayList<>();
             for (RaftPeer peer : peers) {
                 if (!peer.getId().equals(nodeId)) {
-                    replicateLog(peer);
+                    // 向每个 peer 节点发送日志复制请求，并返回一个 CompletableFuture
+                    CompletableFuture<Void> replicateFuture = replicateLog(peer);
+                    replicationFutures.add(replicateFuture);
                 }
             }
 
+            // 使用 allOf 等待所有复制操作完成
+            CompletableFuture<Void> allReplications = CompletableFuture.allOf(replicationFutures.toArray(new CompletableFuture[0]));
+
+            // 当所有复制操作完成时，标记 future 为完成
+            allReplications.thenRun(() -> {
+                future.complete(true); // 所有复制完成，标记为成功
+            }).exceptionally(ex -> {
+                // 如果有任何复制失败，标记 future 为异常
+                future.completeExceptionally(ex);
+                return null;
+            });
+
+            // 返回待完成的 future
             return future;
         } catch (Exception e) {
             log.error("Failed to propose command: {}", e.getMessage());
